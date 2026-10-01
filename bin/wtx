@@ -1,0 +1,1095 @@
+#!/usr/bin/env bash
+set -u
+
+# Sync deliberately-untracked (gitignored) config between git worktrees. A worktree
+# already has every tracked file from git; this only moves whatever gitignored
+# config you've listed in .worktreeinclude (e.g. .env*) that won't come across.
+#
+# Model: the PRIMARY checkout (first `git worktree list` entry) is the hub, like a
+# git remote. `push` sends your config to the hub (or another worktree); `pull`
+# brings the hub's config (or another worktree's) into where you stand. Direction
+# is fixed by the verb; the optional arg only names the OTHER endpoint. Both are
+# additive -- they never overwrite or delete, so they can't clobber a live .env.
+#
+# Subcommands:
+#   new [BRANCH]    Create a worktree under $WTX_ROOT/<repo>/<branch> from
+#                   current HEAD, then seed gitignored config from the primary
+#                   checkout (overwriting -- the new plot is empty) and install
+#                   deps. BRANCH omitted => auto name YY-MM-DD-<modifier>-<fish>.
+#                   Flags: -n/--dry-run, --no-seed, --no-install.
+#                   Prints the new worktree path on stdout (the `wtx` shell function
+#                   consumes it to cd you in); all other output goes to stderr.
+#
+#   list            Status table of this repo's worktrees: branch, STATUS, path.
+#                   STATUS uses git's own terms: primary, not fully merged,
+#                   removable, squashed (squash/rebase-merged), staged, unstaged,
+#                   untracked, detached, locked, missing. `squashed` is detected by
+#                   patch-equivalence since squash merges rewrite SHAs. `*` marks
+#                   the current worktree. STATUS is colored on
+#                   a TTY (NO_COLOR=1 disables); piped output is plain/header-less.
+#
+#   path [NAME]     Print the absolute path of one worktree of this repo on stdout
+#   cd [NAME]       (all other output on stderr). NAME matches a branch name or dir
+#                   basename: exact first, then substring. No NAME or several
+#                   matches => pick with fzf (or a numbered list) on the TTY; no
+#                   TTY => error. Cancel exits 130. `--names` prints one name per
+#                   worktree (for shell completion). `cd` is an alias of `path`.
+#
+#   init SHELL      Print shell setup code (zsh or bash) from <repo>/shell/ for
+#                   `eval "$(wtx init zsh)"`.
+#
+#   push [TARGET]   Send THIS worktree's ($PWD) gitignored config to TARGET.
+#                   TARGET defaults to the PRIMARY checkout (the hub); pass a
+#                   worktree (path, branch name, or dir basename, resolved like
+#                   `rm`) to send it to that worktree instead. This is the
+#                   pre-teardown "save my config to the hub" step.
+#                     SRC = $PWD's worktree;  DST = TARGET (default: primary)
+#
+#   pull [SOURCE]   Bring SOURCE's gitignored config INTO this worktree ($PWD).
+#                   SOURCE defaults to the PRIMARY checkout (the hub); pass a
+#                   worktree to pull from that worktree instead.
+#                     SRC = SOURCE (default: primary);  DST = $PWD's worktree
+#
+#                   push/pull are additive (never overwrite/delete) and only touch
+#                   what .worktreeinclude lists. Direction is fixed by the verb; the
+#                   arg only names the other endpoint. A no-op (SRC == DST, e.g.
+#                   `pull` while standing in the primary) errors.
+#
+#   rm NAME         Post-merge teardown for one worktree. Run from your primary
+#                   checkout (on main, master, or any branch) -- just not from
+#                   inside the worktree being removed. NAME is a branch name,
+#                   worktree path, or worktree dir basename; resolved via
+#                   `git worktree list`. Interactive -- confirms before acting.
+#                   Steps: git worktree remove -> delete the branch only if its
+#                          work is in HEAD: -d for a SHA-reachable merge, -D for a
+#                          squash/rebase merge (detected by patch-equivalence)
+#                          -> git worktree prune
+#                   Does NOT push config: run `wtx push` first if you
+#                   want to preserve gitignored config from the worktree.
+#                   Flags: -n/--dry-run print the plan and exit (no changes);
+#                          -y/--yes skip prompts; -f/--force discard a dirty
+#                          worktree on remove. Refuses to touch the main checkout.
+#
+# Generated artifacts (node_modules, dist, .turbo, ...) and OS/editor junk
+# (.DS_Store, Thumbs.db, desktop.ini, .directory) are skipped.
+#
+# What gets synced is entirely defined by a gitignored .worktreeinclude file in
+# the PRIMARY checkout: one gitignore-style pattern per line (# comments, blank
+# lines ok; leading / anchors to repo root, otherwise matches at any depth or by
+# basename; leading ! negates a preceding match, last match wins) -- e.g. `.env*`
+# for local secrets. This is the same filename Claude Code Desktop and
+# `git-worktreeinclude` read, so one file can serve both. No .worktreeinclude =>
+# nothing to seed/push/pull, silently. Add .worktreeinclude itself to .gitignore
+# so it propagates to new worktrees like any other config (it always
+# self-propagates, whether or not it's listed inside itself).
+#
+# Negation caveat: `new`/seed enumerates with `git ls-files --directory`, which
+# collapses a fully-ignored directory into one entry -- a negation targeting a
+# file *inside* such a directory won't be applied during seed (the whole dir is
+# copied). Negation is reliable for push/pull (per-file enumeration) and for
+# top-level entries during seed.
+
+# --- .worktreeinclude ----------------------------------------------------------
+KEEP_FILE=".worktreeinclude"
+KEEP_PATTERNS=()
+
+load_keep_patterns() {
+  local primary="$1" line
+  KEEP_PATTERNS=()
+  [ -f "$primary/$KEEP_FILE" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in ''|'#'*) continue ;; esac
+    KEEP_PATTERNS+=("$line")
+  done < "$primary/$KEEP_FILE"
+}
+
+# One pattern vs one path: `/`-anchored glob against the full relative path,
+# otherwise a bare glob matches the full path, any parent-relative suffix, or
+# just the basename.
+_pat_matches() {
+  local rel="$1" base="$2" pat="$3"
+  # The unquoted $pat is deliberate: it must match as a glob.
+  # shellcheck disable=SC2053
+  if [ "${pat#/}" != "$pat" ]; then
+    pat="${pat#/}"
+    [[ "$rel" == $pat ]] && return 0
+  else
+    [[ "$rel" == $pat ]] && return 0
+    [[ "$rel" == */$pat ]] && return 0
+    [[ "$base" == $pat ]] && return 0
+  fi
+  return 1
+}
+
+# gitignore semantics: last matching pattern wins. A leading `!` negates.
+matches_keep() {
+  local rel="${1%/}" pat base neg result=1
+  base="${rel##*/}"
+  # The ${x[@]+...} form keeps bash 3.2 (set -u) from failing on an empty array.
+  for pat in ${KEEP_PATTERNS[@]+"${KEEP_PATTERNS[@]}"}; do
+    neg=0
+    case "$pat" in '!'*) neg=1; pat="${pat#\!}" ;; esac
+    pat="${pat%/}"
+    if _pat_matches "$rel" "$base" "$pat"; then
+      result=$(( neg ? 1 : 0 ))
+    fi
+  done
+  return "$result"
+}
+
+# The full allowlist, used by both copy engines (do_seed's --directory walk and
+# sync_config's file-level walk): anything matched by .worktreeinclude, plus
+# .worktreeinclude itself so it always self-propagates (even if it doesn't list
+# itself). Nested inside a generated-artifact dir (a dependency that ships its
+# own .env, etc.) is NOT ours -- reject it before the keep-file check so it can't
+# be dragged in by an overly broad pattern like `.env*`.
+is_allowed() {
+  local rel="${1%/}"
+  case "/$rel/" in
+    */node_modules/*|*/dist/*|*/.turbo/*|*/.next/*|*/build/*|*/.git/*) return 1 ;;
+  esac
+  # A stray ignored file (e.g. .DS_Store) sitting next to tracked files -- not
+  # collapsed into a directory entry by `ls-files --directory` -- can still get
+  # enumerated on its own; reject junk basenames before the path check below,
+  # since rsync's --exclude only filters recursion contents, not an explicit
+  # source argument that IS the junk file itself.
+  case "${rel##*/}" in
+    .DS_Store|Thumbs.db|desktop.ini|.directory) return 1 ;;
+    "$KEEP_FILE") return 0 ;;
+  esac
+  matches_keep "$rel" && return 0
+  return 1
+}
+
+do_seed() {
+  local SRC="${1:-}"
+  local DST="${2:-$PWD}"
+
+  if [ -z "$SRC" ] || [ ! -d "$SRC" ]; then
+    echo "wtx seed: source path missing or not a dir: '$SRC'" >&2
+    exit 1
+  fi
+
+  local copied=0 rel destdir rc
+  while IFS= read -r -d '' rel; do
+    rel="${rel%/}"
+    is_allowed "$rel" || continue
+    destdir="$DST/$(dirname "$rel")"
+    # rsync -L dereferences symlinks into real files so the worktree is
+    # self-contained: some config dirs (.claude/.agents) are relative symlinks
+    # in the source, and a few contain dangling nested links. cp -RL aborts the
+    # whole dir on a dangling link; rsync copies the rest and skips it (exit 23).
+    mkdir -p "$destdir"
+    rsync -rL --exclude='.DS_Store' --exclude='Thumbs.db' --exclude='desktop.ini' --exclude='.directory' "$SRC/$rel" "$destdir/"
+    rc=$?
+    if [ "$rc" -eq 0 ] || [ "$rc" -eq 23 ] || [ "$rc" -eq 24 ]; then
+      echo "COPIED: $rel"      # 23/24 = partial (dangling/vanished link); detail in stderr above
+      copied=$((copied+1))
+    else
+      echo "FAILED: $rel (rsync exit $rc)"
+    fi
+  done < <(git -C "$SRC" ls-files --others --ignored --exclude-standard --directory -z)
+
+  echo "---"
+  echo "synced $copied path(s) from $SRC"
+}
+
+# Additive copy of new gitignored config from SRC into DST. Used by push and pull.
+# Never overwrites an existing file and never deletes -- safe to run into a live
+# worktree (won't clobber a local .env). Only what .worktreeinclude lists.
+sync_config() {
+  local SRC="$1" DST="$2"
+  local copied=0 rel destdir rc
+  # File-level enumeration (no --directory) so the additive existence check works
+  # per-file inside an already-existing config dir. node_modules is excluded at
+  # the git level (the pathspec on the `done` line): it dominates the
+  # ignored-file scan (tens of thousands of entries, none ours) and would otherwise
+  # add a ~1s silent pause before the first result.
+  while IFS= read -r -d '' rel; do
+    # Backstop: never copy from a node_modules dir at any depth (a dependency
+    # shipping its own config is not our config).
+    case "/$rel/" in */node_modules/*) continue ;; esac
+    is_allowed "$rel" || continue
+    # Additive-only: never overwrite a file that already exists in DST.
+    [ -e "$DST/$rel" ] && continue
+    destdir="$DST/$(dirname "$rel")"
+    # rsync -L dereferences symlinked config dirs into real files.
+    mkdir -p "$destdir"
+    rsync -L --exclude='.DS_Store' --exclude='Thumbs.db' --exclude='desktop.ini' --exclude='.directory' "$SRC/$rel" "$destdir/"
+    rc=$?
+    if [ "$rc" -eq 0 ] || [ "$rc" -eq 23 ] || [ "$rc" -eq 24 ]; then
+      echo "COPIED: $rel"
+      copied=$((copied+1))
+    else
+      echo "FAILED: $rel (rsync exit $rc)"
+    fi
+  done < <(git -C "$SRC" ls-files --others --ignored --exclude-standard -z \
+             -- . ':(exclude)**/node_modules/**')
+
+  echo "---"
+  echo "copied $copied new path(s) into $DST"
+}
+
+# Resolve a worktree identifier (path | branch name | dir basename) to its path,
+# printing an error + the worktree list on stderr and returning 1 on no match.
+# Used by push/pull to resolve the "other endpoint" arg the way `rm` does.
+resolve_wt_path() {
+  local verb="$1" target="$2" resolved
+  resolved="$(resolve_worktree "$target")" || {
+    echo "wtx $verb: no worktree matches '$target'. Known worktrees:" >&2
+    git worktree list >&2
+    return 1
+  }
+  printf '%s\n' "${resolved%%$'\t'*}"
+}
+
+# Shared tail for push/pull: refuse a no-op, then additive-copy SRC's config to DST.
+do_transfer() {
+  local verb="$1" SRC="$2" DST="$3"
+  if [ "$SRC" = "$DST" ]; then
+    echo "wtx $verb: source and destination are the same worktree ($SRC)." >&2
+    echo "  Nothing to $verb. (From the primary checkout, name another worktree.)" >&2
+    exit 1
+  fi
+  if [ ! -d "$SRC" ]; then
+    echo "wtx $verb: source is not a dir: '$SRC' (skipping)"
+    exit 0
+  fi
+  sync_config "$SRC" "$DST"
+  exit 0
+}
+
+# push [TARGET] -- send THIS worktree's ($PWD) config to TARGET (default: primary).
+do_push() {
+  local arg="${1:-}"
+  local PRIMARY HERE SRC DST
+  PRIMARY="$(resolve_main_checkout)"
+  [ -z "$PRIMARY" ] && { echo "wtx push: not in a git repo (skipping)"; exit 0; }
+  HERE="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)"
+  [ -z "$HERE" ] && { echo "wtx push: not inside a git worktree." >&2; exit 1; }
+
+  SRC="$HERE"
+  if [ -n "$arg" ]; then
+    DST="$(resolve_wt_path push "$arg")" || exit 1
+  else
+    DST="$PRIMARY"
+  fi
+  do_transfer push "$SRC" "$DST"
+}
+
+# pull [SOURCE] -- bring SOURCE's config (default: primary) INTO this worktree ($PWD).
+do_pull() {
+  local arg="${1:-}"
+  local PRIMARY HERE SRC DST
+  PRIMARY="$(resolve_main_checkout)"
+  [ -z "$PRIMARY" ] && { echo "wtx pull: not in a git repo (skipping)"; exit 0; }
+  HERE="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)"
+  [ -z "$HERE" ] && { echo "wtx pull: not inside a git worktree." >&2; exit 1; }
+
+  DST="$HERE"
+  if [ -n "$arg" ]; then
+    SRC="$(resolve_wt_path pull "$arg")" || exit 1
+  else
+    SRC="$PRIMARY"
+  fi
+  do_transfer pull "$SRC" "$DST"
+}
+
+# Prompt for confirmation on stderr; returns 0 only on an explicit yes.
+# Bypassed entirely when ASSUME_YES=1 (-y/--yes).
+confirm() {
+  [ "${ASSUME_YES:-0}" = "1" ] && return 0
+  local reply
+  printf '%s [y/N] ' "$1" >&2
+  read -r reply || return 1
+  case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
+}
+
+# Resolve a target (branch name | worktree path | dir basename) to its worktree
+# path + branch via `git worktree list`. Prints "PATH<TAB>BRANCH"; returns 1 if
+# no match. BRANCH is empty for a detached worktree.
+resolve_worktree() {
+  local target="$1"
+  local path="" branch="" line
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) path="${line#worktree }"; branch="" ;;
+      "branch "*)   branch="${line#branch refs/heads/}" ;;
+      "")
+        local bn="${path##*/}"
+        if [ "$path" = "$target" ] || [ "$branch" = "$target" ] || [ "$bn" = "$target" ]; then
+          printf '%s\t%s\n' "$path" "$branch"; return 0
+        fi
+        path=""; branch=""
+        ;;
+    esac
+  done < <(git worktree list --porcelain)
+  return 1
+}
+
+# Echo how BRANCH's work reaches MAIN's HEAD:
+#   ancestor  branch tip is reachable by SHA (fast-forward / merge commit)
+#   squashed  branch's net diff already exists in HEAD as an equivalent patch
+#             (squash- or rebase-merge, where the commits got new SHAs)
+#   <empty>   genuinely unmerged
+# The squash check synthesizes a commit of the branch's whole tree against the
+# fork point and asks `git cherry` if that patch is already upstream. It is a
+# safe false-negative (reports unmerged) if extra commits landed on the branch
+# after the squash, or HEAD later touched the same lines; it never false-positives.
+branch_merge_state() {
+  local main_dir="$1" branch="$2"
+  [ -z "$branch" ] && return 0
+  if git -C "$main_dir" merge-base --is-ancestor "$branch" HEAD 2>/dev/null; then
+    echo ancestor; return 0
+  fi
+  local mb tree synth
+  mb="$(git -C "$main_dir" merge-base HEAD "$branch" 2>/dev/null)" || return 0
+  tree="$(git -C "$main_dir" rev-parse "$branch^{tree}" 2>/dev/null)" || return 0
+  synth="$(git -C "$main_dir" commit-tree "$tree" -p "$mb" -m _ 2>/dev/null)" || return 0
+  case "$(git -C "$main_dir" cherry HEAD "$synth" 2>/dev/null)" in
+    "-"*) echo squashed ;;
+  esac
+  return 0
+}
+
+do_rm() {
+  # Parse flags; first non-flag arg is the target.
+  local target="" ASSUME_YES=0 FORCE=0 DRY_RUN=0 a
+  for a in "$@"; do
+    case "$a" in
+      -y|--yes)     ASSUME_YES=1 ;;
+      -f|--force)   FORCE=1 ;;
+      -n|--dry-run) DRY_RUN=1 ;;
+      -*)           echo "wtx rm: unknown flag: $a" >&2; exit 1 ;;
+      *)
+        if [ -n "$target" ]; then echo "wtx rm: unexpected arg: $a" >&2; exit 1; fi
+        target="$a" ;;
+    esac
+  done
+  if [ -z "$target" ]; then
+    echo "wtx rm: need a branch name or worktree path/name" >&2
+    exit 1
+  fi
+
+  local MAIN
+  MAIN="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "wtx rm: run this from your primary checkout on main/master (not a git repo here)" >&2
+    exit 1
+  }
+
+  local resolved wt_path branch
+  resolved="$(resolve_worktree "$target")" || {
+    echo "wtx rm: no worktree matches '$target'. Known worktrees:" >&2
+    git worktree list >&2
+    exit 1
+  }
+  wt_path="${resolved%%$'\t'*}"
+  branch="${resolved#*$'\t'}"
+
+  # Safety: never operate on the main checkout itself.
+  if [ "$wt_path" = "$MAIN" ]; then
+    echo "wtx rm: '$target' is the main checkout -- refusing." >&2
+    exit 1
+  fi
+  # Safety: must be run from main, not from inside the target worktree.
+  case "$PWD/" in
+    "$wt_path"/*) echo "wtx rm: you are inside the worktree being removed. cd to the main checkout first." >&2; exit 1 ;;
+  esac
+
+  # Merge state: ancestor (true merge), squashed (squash/rebase), or empty.
+  # Branch is safe to delete if its work is in HEAD by either route.
+  local merge_state merged=0
+  merge_state="$(branch_merge_state "$MAIN" "$branch")"
+  [ -n "$merge_state" ] && merged=1
+  # Dirty? (uncommitted tracked changes or untracked-not-ignored files)
+  local dirty=0
+  [ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ] && dirty=1
+
+  # Plan summary.
+  echo "wtx rm -- plan:"
+  echo "  worktree:  $wt_path"
+  echo "  branch:    ${branch:-<detached>}  (safe to delete: $([ "$merged" = 1 ] && echo "yes (${merge_state}-merged)" || echo no))"
+  echo "  steps:"
+  if [ "$dirty" = 1 ]; then
+    echo "    1. git worktree remove$([ "$FORCE" = 1 ] && echo ' --force (DISCARDS uncommitted changes)')"
+  else
+    echo "    1. git worktree remove"
+  fi
+  if [ -n "$branch" ] && [ "$merge_state" = "ancestor" ]; then
+    echo "    2. git branch -d $branch"
+  elif [ -n "$branch" ] && [ "$merge_state" = "squashed" ]; then
+    echo "    2. git branch -D $branch  (squash-merged: -d would refuse it)"
+  else
+    echo "    2. SKIP branch delete ($([ -z "$branch" ] && echo detached || echo 'has unique commits'))"
+  fi
+  echo "    3. git worktree prune"
+  echo "  (config is NOT saved -- run 'wtx push' first if you want to keep it)"
+
+  # Dry run: show the plan only, never prompt or change anything.
+  if [ "$DRY_RUN" = 1 ]; then
+    if [ "$dirty" = 1 ] && [ "$FORCE" != 1 ]; then
+      echo "  note: worktree is dirty -- a real run would need --force"
+    fi
+    echo "[dry run] no changes made."
+    exit 0
+  fi
+
+  # A dirty worktree would block removal; require explicit --force to discard.
+  if [ "$dirty" = 1 ] && [ "$FORCE" != 1 ]; then
+    echo "wtx rm: worktree has uncommitted/untracked changes." >&2
+    echo "  Commit them, or re-run with --force to discard on remove." >&2
+    exit 1
+  fi
+
+  confirm "Proceed?" || { echo "aborted."; exit 0; }
+
+  # 1. remove (saving config is intentionally separate -- run `wtx push`
+  # beforehand if you want to preserve gitignored config from the worktree).
+  if [ "$FORCE" = 1 ]; then
+    git worktree remove --force "$wt_path" || { echo "wtx rm: remove failed; stopping." >&2; exit 1; }
+  else
+    git worktree remove "$wt_path" || { echo "wtx rm: remove failed; stopping." >&2; exit 1; }
+  fi
+  echo "removed worktree: $wt_path"
+
+  # 2. branch (only if its work is in HEAD). A true merge uses -d; a squash/rebase
+  # merge needs -D because -d only recognizes SHA-reachable merges.
+  if [ -n "$branch" ] && [ "$merge_state" = "ancestor" ]; then
+    if confirm "Delete branch '$branch' (merged)?"; then
+      git branch -d "$branch" && echo "deleted branch: $branch"
+    else
+      echo "kept branch: $branch"
+    fi
+  elif [ -n "$branch" ] && [ "$merge_state" = "squashed" ]; then
+    if confirm "Delete branch '$branch' (squash-merged; needs -D)?"; then
+      git branch -D "$branch" && echo "deleted branch: $branch"
+    else
+      echo "kept branch: $branch"
+    fi
+  elif [ -n "$branch" ]; then
+    echo "kept branch '$branch' (has unique commits). Delete manually: git branch -D $branch"
+  fi
+
+  # 3. prune
+  git worktree prune
+  echo "done."
+}
+
+# --- new ---------------------------------------------------------------------
+
+# Inline word lists for the auto-generated name (no network). Slug-safe.
+MODIFIERS=(rapid swift bold calm brave keen lush nimble vivid amber azure coral
+  crimson dapper eager fancy gentle hardy jolly lucky mellow plucky quirky rustic
+  sleek snappy spry sturdy sunny witty zesty)
+FISH=(tuna marlin trout bass cod perch pike carp eel guppy halibut herring
+  mackerel minnow mullet pollock salmon sardine snapper sole tarpon tetra wahoo
+  walleye anchovy barracuda catfish flounder grouper haddock)
+
+# YY-MM-DD-<modifier>-<fish>, e.g. 26-06-29-rapid-tuna.
+gen_name() {
+  printf '%s-%s-%s\n' \
+    "$(date +%y-%m-%d)" \
+    "${MODIFIERS[RANDOM % ${#MODIFIERS[@]}]}" \
+    "${FISH[RANDOM % ${#FISH[@]}]}"
+}
+
+# Absolute path of the repo's MAIN worktree (git lists it first). Stable even
+# when run from inside a linked worktree, unlike `git rev-parse --show-toplevel`.
+resolve_main_checkout() {
+  git worktree list --porcelain 2>/dev/null \
+    | awk '/^worktree /{print substr($0, 10); exit}'
+}
+
+# Echo the install command for whichever lockfile DIR has, or nothing.
+detect_installer() {
+  local d="$1"
+  if   [ -f "$d/pnpm-lock.yaml" ];   then echo "pnpm install"
+  elif [ -f "$d/package-lock.json" ]; then echo "npm install"
+  elif [ -f "$d/yarn.lock" ];        then echo "yarn install"
+  elif [ -f "$d/bun.lockb" ];        then echo "bun install"
+  fi
+}
+
+do_new() {
+  local BRANCH="" DRY_RUN=0 NO_SEED=0 NO_INSTALL=0 a
+  for a in "$@"; do
+    case "$a" in
+      -n|--dry-run) DRY_RUN=1 ;;
+      --no-seed)    NO_SEED=1 ;;
+      --no-install) NO_INSTALL=1 ;;
+      -*)           echo "wtx new: unknown flag: $a" >&2; exit 1 ;;
+      *)
+        if [ -n "$BRANCH" ]; then echo "wtx new: unexpected arg: $a" >&2; exit 1; fi
+        BRANCH="$a" ;;
+    esac
+  done
+
+  local MAIN
+  MAIN="$(resolve_main_checkout)"
+  if [ -z "$MAIN" ]; then
+    echo "wtx new: not in a git repo (no worktree found)." >&2
+    exit 1
+  fi
+
+  # Branch base = current HEAD; refuse a detached HEAD.
+  local SRC_REF
+  SRC_REF="$(git symbolic-ref -q --short HEAD)" || {
+    echo "wtx new: HEAD is detached -- check out a branch first." >&2
+    exit 1
+  }
+
+  local REPO ROOT DEST_DIR explicit NAME
+  REPO="$(basename "$MAIN")"
+  ROOT="${WTX_ROOT:-${WORKTREE_ROOT:-$HOME/code/.worktrees}}"
+  ROOT="${ROOT/#\~/$HOME}"
+  DEST_DIR="$ROOT/$REPO"
+  if [ -n "$BRANCH" ]; then explicit=1; NAME="$BRANCH"; else explicit=0; NAME="$(gen_name)"; fi
+
+  # Refuse to nest the worktree inside the repo it forks from (e.g. a stray
+  # WORKTREE_ROOT="$PWD/.worktrees" set from inside the repo).
+  case "$DEST_DIR/" in
+    "$MAIN"/*) echo "wtx new: worktree root '$ROOT' is inside the main checkout '$MAIN' -- pick a root outside the repo." >&2; exit 1 ;;
+  esac
+
+  # Dry run: print the plan to stderr, change nothing, emit no stdout path.
+  if [ "$DRY_RUN" = 1 ]; then
+    local inst; inst="$(detect_installer "$MAIN")"
+    # echo cannot fail, so A && B || C is safe here; the $VARS are literal labels.
+    # shellcheck disable=SC2015,SC2016
+    {
+      echo "wtx new -- plan:"
+      echo "  main checkout: $MAIN"
+      echo "  repo:          $REPO"
+      echo "  source ref:    $SRC_REF"
+      echo "  worktree root: $ROOT$([ -n "${WTX_ROOT:-}" ] && echo '  (from $WTX_ROOT)' || ([ -n "${WORKTREE_ROOT:-}" ] && echo '  (from $WORKTREE_ROOT)' || echo '  (default)'))"
+      echo "  branch:        $NAME$([ "$explicit" = 0 ] && echo '  (auto; final name may differ on collision)')"
+      echo "  worktree:      $DEST_DIR/$NAME"
+      echo "  seed:          $([ "$NO_SEED" = 1 ] && echo 'skip (--no-seed)' || echo "seed gitignored config from main")"
+      echo "  install:       $([ "$NO_INSTALL" = 1 ] && echo 'skip (--no-install)' || { [ -n "$inst" ] && echo "$inst" || echo 'skip (no lockfile)'; })"
+      echo "[dry run] no changes made."
+    } >&2
+    exit 0
+  fi
+
+  mkdir -p "$DEST_DIR"
+
+  # Create worktree+branch. git is the collision judge: on failure for an auto
+  # name, regenerate and retry; for an explicit name, surface the error.
+  local WT_PATH tries=0 max=5
+  while :; do
+    WT_PATH="$DEST_DIR/$NAME"
+    if git worktree add -b "$NAME" "$WT_PATH" >&2; then
+      break
+    fi
+    if [ "$explicit" = 1 ]; then
+      echo "wtx new: git worktree add failed for '$NAME'." >&2
+      exit 1
+    fi
+    tries=$((tries + 1))
+    if [ "$tries" -ge "$max" ]; then
+      echo "wtx new: no free auto name after $max tries -- re-run." >&2
+      exit 1
+    fi
+    NAME="$(gen_name)"
+  done
+  echo "created worktree: $WT_PATH  (branch $NAME from $SRC_REF)" >&2
+
+  # Seed gitignored config from main (SRC) into the new worktree (DST). Its
+  # stdout goes to stderr so only the final path stays on stdout.
+  if [ "$NO_SEED" != 1 ]; then
+    do_seed "$MAIN" "$WT_PATH" >&2
+  fi
+
+  # Install deps if a lockfile is present.
+  if [ "$NO_INSTALL" != 1 ]; then
+    local inst; inst="$(detect_installer "$WT_PATH")"
+    if [ -n "$inst" ]; then
+      echo "running: $inst (in $WT_PATH)" >&2
+      ( cd "$WT_PATH" && $inst ) >&2
+    fi
+  fi
+
+  # The ONLY stdout line: the new worktree path (the `wtx` function cd's here).
+  echo "$WT_PATH"
+}
+
+# --- list --------------------------------------------------------------------
+
+# Emit an ANSI-wrapped string when USE_COLOR=1, else the text plain. USE_COLOR
+# is computed once in do_list (the TTY check must run there, not here: colorize
+# is called inside $(...), whose stdout is a pipe, so `-t 1` would always fail).
+colorize() {
+  local code="$1" text="$2"
+  if [ "${USE_COLOR:-0}" = 1 ]; then
+    printf '\033[%sm%s\033[0m' "$code" "$text"
+  else
+    printf '%s' "$text"
+  fi
+}
+
+# Map a status label to its ANSI code.
+status_color() {
+  case "$1" in
+    removable)          echo "32" ;;   # green
+    squashed)           echo "92" ;;   # bright green (squash/rebase-merged)
+    staged)             echo "33" ;;   # yellow (changes staged in the index)
+    unstaged)           echo "31" ;;   # red    (tracked edits not staged)
+    untracked)          echo "2"  ;;   # dim    (new files only)
+    "not fully merged") echo "36" ;;   # cyan
+    primary)            echo "1"  ;;   # bold
+    missing)            echo "31" ;;   # red
+    locked)             echo "35" ;;   # magenta
+    detached)           echo "2"  ;;   # dim/grey
+    *)                  echo "0"  ;;
+  esac
+}
+
+# Echo the working-tree change state of dir $1 in git terms, or nothing if clean.
+# Priority staged > unstaged > untracked (git porcelain XY: X=index, Y=worktree).
+worktree_change_state() {
+  local d="$1" line x y staged=0 unstaged=0 untracked=0
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    x="${line:0:1}"; y="${line:1:1}"
+    if [ "$x$y" = "??" ]; then untracked=1; continue; fi
+    [ "$x" != " " ] && staged=1
+    [ "$y" != " " ] && unstaged=1
+  done < <(git -C "$d" status --porcelain 2>/dev/null)
+  if   [ "$staged"    = 1 ]; then echo "staged"
+  elif [ "$unstaged"  = 1 ]; then echo "unstaged"
+  elif [ "$untracked" = 1 ]; then echo "untracked"
+  fi
+}
+
+# Echo the STATUS label of one worktree record (shared by `list` and `path`).
+# Args: MAIN PATH BRANCH DETACHED LOCKED PRUNABLE (flags are 0/1).
+# First match wins. Working-tree changes (the loss warning) dominate identity;
+# their git-accurate kind comes from worktree_change_state.
+worktree_status() {
+  local main="$1" path="$2" branch="$3" detached="$4" locked="$5" prunable="$6" changes=""
+  [ -d "$path" ] && changes="$(worktree_change_state "$path")"
+  if   [ "$prunable" = 1 ]; then echo "missing"
+  elif [ "$locked"   = 1 ]; then echo "locked"
+  elif [ -n "$changes" ];    then echo "$changes"
+  elif [ "$path" = "$main" ]; then echo "primary"
+  elif [ "$detached" = 1 ] || [ -z "$branch" ]; then echo "detached"
+  else
+    case "$(branch_merge_state "$main" "$branch")" in
+      ancestor) echo "removable" ;;
+      squashed) echo "squashed" ;;
+      *)        echo "not fully merged" ;;
+    esac
+  fi
+}
+
+# Status-enriched overview of every worktree for the current repo. Reuses the
+# dirty/merged logic from `rm` so `removable` here == "safe to delete" there.
+do_list() {
+  local MAIN
+  MAIN="$(resolve_main_checkout)"
+  if [ -z "$MAIN" ]; then
+    echo "wtx list: not in a git repo (no worktree found)." >&2
+    exit 1
+  fi
+
+  # First pass: parse porcelain records into parallel arrays, tracking the
+  # widest branch label so the table can be aligned in the second pass.
+  local -a paths=() branches=() statuses=() gutters=()
+  local path="" branch="" detached=0 locked=0 prunable=0 bare=0
+  local maxw=6 maxsw=6   # len("BRANCH"), len("STATUS")
+  local line
+
+  emit_record() {
+    [ -z "$path" ] && return
+    if [ "$bare" = 1 ]; then return; fi   # skip the bare-repo entry
+
+    local status label gutter=""
+    status="$(worktree_status "$MAIN" "$path" "$branch" "$detached" "$locked" "$prunable")"
+    [ "${#status}" -gt "$maxsw" ] && maxsw="${#status}"
+
+    # `*` if the current dir is this worktree (or a subdir of it).
+    case "$PWD/" in "$path"/*) gutter="*" ;; esac
+
+    label="${branch:-<detached>}"
+    [ "${#label}" -gt "$maxw" ] && maxw="${#label}"
+
+    # Show $HOME as ~ (a literal "~" in the replacement prints '~' in bash 3.2).
+    case "$path" in
+      "$HOME"|"$HOME"/*) paths+=("~${path#"$HOME"}") ;;
+      *)                 paths+=("$path") ;;
+    esac
+    branches+=("$label")
+    statuses+=("$status")
+    gutters+=("$gutter")
+  }
+
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) emit_record
+                    path="${line#worktree }"; branch=""; detached=0; locked=0; prunable=0; bare=0 ;;
+      "branch "*)   branch="${line#branch refs/heads/}" ;;
+      "detached")   detached=1 ;;
+      "locked"|"locked "*)     locked=1 ;;
+      "prunable"|"prunable "*) prunable=1 ;;
+      "bare")       bare=1 ;;
+    esac
+  done < <(git worktree list --porcelain)
+  emit_record   # flush the final record (porcelain ends without a trailing key)
+
+  # Decide color once, in the main shell where stdout is the real destination
+  # (not the $(...) pipe colorize runs in). TTY + NO_COLOR-unset gates it.
+  local USE_COLOR=0
+  { [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; } && USE_COLOR=1
+
+  # Header only on a TTY (keeps piped output header-less and grep-able).
+  if [ -t 1 ]; then
+    printf '  %-*s  %-*s  %s\n' "$maxw" "BRANCH" "$maxsw" "STATUS" "PATH"
+  fi
+
+  local i status colored
+  for i in "${!paths[@]}"; do
+    status="${statuses[$i]}"
+    colored="$(colorize "$(status_color "$status")" "$(printf '%-*s' "$maxsw" "$status")")"
+    printf '%s %-*s  %s  %s\n' \
+      "${gutters[$i]:- }" "$maxw" "${branches[$i]}" "$colored" "${paths[$i]}"
+  done
+}
+
+# --- path / cd -----------------------------------------------------------------
+
+# Parse `git worktree list --porcelain` into one line per usable worktree:
+#   PATH<TAB>BRANCH<TAB>DETACHED<TAB>LOCKED
+# BRANCH is empty when detached. Bare and prunable (missing) entries are skipped.
+worktree_records() {
+  local path="" branch="" detached=0 locked=0 prunable=0 bare=0 line
+  _wt_flush() {
+    [ -z "$path" ] && return
+    [ "$bare" = 1 ] || [ "$prunable" = 1 ] && return
+    printf '%s\t%s\t%s\t%s\n' "$path" "$branch" "$detached" "$locked"
+  }
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) _wt_flush
+                    path="${line#worktree }"; branch=""; detached=0; locked=0; prunable=0; bare=0 ;;
+      "branch "*)   branch="${line#branch refs/heads/}" ;;
+      "detached")   detached=1 ;;
+      "locked"|"locked "*)     locked=1 ;;
+      "prunable"|"prunable "*) prunable=1 ;;
+      "bare")       bare=1 ;;
+    esac
+  done < <(git worktree list --porcelain 2>/dev/null)
+  _wt_flush   # flush the final record
+}
+
+# True when an interactive picker can talk to the user: stderr is a TTY and
+# /dev/tty can be opened (works inside `$(...)`, where stdout is a pipe).
+have_tty() {
+  [ -t 2 ] && { : < /dev/tty; } 2>/dev/null
+}
+
+# path [NAME] / cd [NAME] -- print the absolute path of one worktree of this
+# repo on stdout (all other output on stderr). NAME matches a branch name or dir
+# basename: exact first, then substring. No NAME or several matches => picker.
+do_path() {
+  local verb="$1"; shift
+  local name="" names_only=0 a
+  for a in "$@"; do
+    case "$a" in
+      --names) names_only=1 ;;
+      -*)      echo "wtx $verb: unknown flag: $a" >&2; exit 1 ;;
+      *)
+        if [ -n "$name" ]; then echo "wtx $verb: unexpected arg: $a" >&2; exit 1; fi
+        name="$a" ;;
+    esac
+  done
+
+  local MAIN
+  MAIN="$(resolve_main_checkout)"
+  if [ -z "$MAIN" ]; then
+    echo "wtx $verb: not in a git repo (no worktree found)." >&2
+    exit 1
+  fi
+
+  local -a paths=() branches=() detacheds=() lockeds=()
+  local p b d l
+  while IFS=$'\t' read -r p b d l; do
+    paths+=("$p"); branches+=("$b"); detacheds+=("$d"); lockeds+=("$l")
+  done < <(worktree_records)
+  local n="${#paths[@]}" i
+
+  # Completion feed: one name per worktree (branch, else dir basename).
+  if [ "$names_only" = 1 ]; then
+    for ((i = 0; i < n; i++)); do
+      printf '%s\n' "${branches[$i]:-${paths[$i]##*/}}"
+    done
+    exit 0
+  fi
+
+  # Candidates: indexes into the arrays above. Exact match first, then substring.
+  local -a cand=()
+  if [ -n "$name" ]; then
+    for ((i = 0; i < n; i++)); do
+      if [ "${branches[$i]}" = "$name" ] || [ "${paths[$i]##*/}" = "$name" ]; then
+        cand+=("$i")
+      fi
+    done
+    if [ "${#cand[@]}" -eq 0 ]; then
+      for ((i = 0; i < n; i++)); do
+        case "${branches[$i]}" in *"$name"*) cand+=("$i"); continue ;; esac
+        case "${paths[$i]##*/}" in *"$name"*) cand+=("$i") ;; esac
+      done
+    fi
+    if [ "${#cand[@]}" -eq 0 ]; then
+      echo "wtx $verb: no worktree matches '$name'" >&2
+      exit 1
+    fi
+    if [ "${#cand[@]}" -eq 1 ]; then
+      printf '%s\n' "${paths[${cand[0]}]}"
+      exit 0
+    fi
+  else
+    for ((i = 0; i < n; i++)); do cand+=("$i"); done
+  fi
+
+  # No TTY: nothing to ask, so list the choices and fail.
+  if ! have_tty; then
+    if [ -n "$name" ]; then
+      echo "wtx $verb: '$name' matches ${#cand[@]} worktrees (no TTY to choose):" >&2
+    else
+      echo "wtx $verb: need a NAME (no TTY to choose). Worktrees:" >&2
+    fi
+    for i in "${cand[@]}"; do
+      printf '  %s\t%s\n' "${branches[$i]:-<detached>}" "${paths[$i]}" >&2
+    done
+    exit 1
+  fi
+
+  # Picker rows: branch, STATUS, path (tab-separated, path last).
+  local -a rows=()
+  local st
+  for i in "${cand[@]}"; do
+    st="$(worktree_status "$MAIN" "${paths[$i]}" "${branches[$i]}" "${detacheds[$i]}" "${lockeds[$i]}" 0)"
+    rows+=("$(printf '%s\t%s\t%s' "${branches[$i]:-<detached>}" "$st" "${paths[$i]}")")
+  done
+
+  local sel
+  if command -v fzf >/dev/null 2>&1; then
+    # fzf reads keys from and draws on /dev/tty; only the chosen row goes to
+    # stdout, so this works inside `$(...)`.
+    sel="$(printf '%s\n' "${rows[@]}" \
+      | fzf --height=40% --reverse --delimiter=$'\t' --tabstop=2 \
+            --prompt="wtx $verb> " --header="branch  status  path")" || exit 130
+  else
+    # Show the tab-separated rows as aligned columns (display only; the
+    # selection below still uses the raw row).
+    local k=0 reply rb rs rp wb=6 ws=6
+    for i in "${!rows[@]}"; do
+      IFS=$'\t' read -r rb rs rp <<< "${rows[$i]}"
+      [ "${#rb}" -gt "$wb" ] && wb="${#rb}"
+      [ "${#rs}" -gt "$ws" ] && ws="${#rs}"
+    done
+    printf '     %-*s  %-*s  %s\n' "$wb" "BRANCH" "$ws" "STATUS" "PATH" >&2
+    for i in "${!rows[@]}"; do
+      k=$((i + 1))
+      IFS=$'\t' read -r rb rs rp <<< "${rows[$i]}"
+      printf '%3d) %-*s  %-*s  %s\n' "$k" "$wb" "$rb" "$ws" "$rs" "$rp" >&2
+    done
+    printf 'pick [1-%d]: ' "$k" >&2
+    read -r reply < /dev/tty || exit 130
+    [ -z "$reply" ] && exit 130
+    case "$reply" in
+      *[!0-9]*) echo "wtx $verb: not a number: '$reply'" >&2; exit 1 ;;
+    esac
+    if [ "$reply" -lt 1 ] || [ "$reply" -gt "$k" ]; then
+      echo "wtx $verb: out of range: $reply" >&2
+      exit 1
+    fi
+    sel="${rows[$((reply - 1))]}"
+  fi
+  [ -z "$sel" ] && exit 130
+  printf '%s\n' "${sel##*$'\t'}"
+}
+
+# --- init ----------------------------------------------------------------------
+
+# Absolute path of the repo this script lives in (the dir above bin/). Follows
+# symlinks with a portable readlink loop (old macOS has no `readlink -f`).
+script_repo_dir() {
+  local src="${BASH_SOURCE[0]:-$0}" dir
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)" || return 1
+    src="$(readlink "$src")"
+    case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  dir="$(cd -P "$(dirname "$src")" && pwd)" || return 1
+  (cd -P "$dir/.." && pwd)
+}
+
+# init SHELL -- print shell setup code for `eval "$(wtx init zsh)"`.
+do_init() {
+  local sh="${1:-}" repo f
+  local -a files=()
+  case "$sh" in
+    zsh)  files=(shell/wt.sh shell/_wt.zsh) ;;
+    bash) files=(shell/wt.sh) ;;
+    *)    echo "wtx init: unsupported shell '$sh' (use zsh or bash)" >&2; exit 2 ;;
+  esac
+  repo="$(script_repo_dir)" || { echo "wtx init: cannot find the wtx install directory." >&2; exit 1; }
+  for f in "${files[@]}"; do
+    if [ ! -f "$repo/$f" ]; then
+      echo "wtx init: missing shell file: $repo/$f" >&2
+      exit 1
+    fi
+  done
+  for f in "${files[@]}"; do
+    cat "$repo/$f"
+  done
+}
+
+usage() {
+  cat <<'EOF'
+wtx -- create, list, jump to, and remove git worktrees, and sync gitignored
+config between them (via a primary-checkout hub).
+
+USAGE
+  wtx new [BRANCH] [-n] [--no-seed] [--no-install]
+                                   create a worktree from current HEAD
+  wtx list                         status table of this repo's worktrees
+  wtx path [NAME] [--names]        print one worktree's path (alias: wtx cd)
+  wtx push [TARGET]                send THIS worktree's config to TARGET (default: primary)
+  wtx pull [SOURCE]                bring SOURCE's config into THIS worktree (default: primary)
+  wtx rm NAME [-n] [-y] [-f]       post-merge teardown of one worktree
+  wtx init SHELL                   print shell setup code (zsh | bash)
+  wtx help | -h | --help           show this help
+
+MODEL
+  The PRIMARY checkout (first `git worktree list` entry) is the hub, like a git
+  remote. push = send out, pull = bring in. Direction is fixed by the verb; the
+  optional arg only names the OTHER endpoint (a worktree path, branch name, or dir
+  basename, resolved like `rm`), defaulting to primary. Both are additive.
+
+  What gets synced is entirely defined by a gitignored .worktreeinclude file in
+  the PRIMARY checkout: one gitignore-style pattern per line (# comments and
+  blank lines ok; leading / anchors to the repo root, otherwise matches at any
+  depth or by basename; leading ! negates, last match wins) -- e.g. `.env*` for
+  local secrets. Same filename Claude Code Desktop and `git-worktreeinclude`
+  read. Add .worktreeinclude itself to .gitignore so it propagates to new
+  worktrees like any other config. No file = nothing to seed/push/pull, silently.
+
+new [BRANCH]
+  Create a worktree at $WTX_ROOT/<repo>/<branch> (default ~/code/.worktrees;
+  $WORKTREE_ROOT is read as a fallback for older setups) with a new branch forked
+  from current HEAD (refuses a detached HEAD), then seed gitignored config from
+  the primary checkout (overwriting -- the plot is fresh) and install deps if a
+  lockfile is present. <repo> and the seed source are resolved from the primary worktree, so
+  this works from anywhere in the repo. BRANCH omitted => auto name
+  YY-MM-DD-<modifier>-<fish>; on a name collision an auto name is regenerated, an
+  explicit name is a hard error.
+  Prints the new worktree path on stdout (the `wtx` shell function cd's you in).
+    -n, --dry-run   print the plan and exit; change nothing
+    --no-seed       skip seeding gitignored config from the primary checkout
+    --no-install    skip dependency install
+
+list
+  Print a status table of every worktree for the current repo, one row each:
+    *          marks the worktree you are currently in
+    BRANCH     branch name (or <detached>)
+    STATUS     primary           main checkout
+               not fully merged  clean, has commits not yet in main
+               removable         clean, merged by SHA -- safe to `rm`
+               squashed          clean, squash/rebase-merged -- safe to `rm`
+               staged            changes staged in the index
+               unstaged          tracked edits not yet staged
+               untracked         new (untracked) files only
+               detached          no branch
+               locked            git worktree lock'd
+               missing           directory gone -- run `git worktree prune`
+    PATH       worktree path ($HOME shown as ~)
+  The STATUS word is colored on a TTY (disable with NO_COLOR=1); piped output is
+  plain and header-less so it stays grep-able. Order matches `git worktree list`.
+
+path [NAME] [--names]   (alias: cd)
+  Print the absolute path of one worktree of the current repo on stdout; all
+  other output goes to stderr. The primary checkout is a choice too; bare and
+  missing (prunable) entries are skipped.
+    NAME       matched against branch names and worktree dir basenames: an exact
+               match first, else a substring match. One match => its path.
+               No match => error, exit 1.
+    no NAME, or several matches => choose on the TTY: fzf if installed, else a
+               numbered list. No TTY => error listing the choices, exit 1.
+               Cancel (Esc or empty input) => exit 130, nothing on stdout.
+    --names    print one name per worktree (branch, else dir basename) and exit;
+               for shell completion.
+  Example:  cd "$(wtx path feat)"
+
+init SHELL
+  Print shell setup code (the `wtx` function, plus zsh completion) for:
+    eval "$(wtx init zsh)"     # in ~/.zshrc
+    eval "$(wtx init bash)"    # in ~/.bashrc
+  Reads shell/wt.sh (and shell/_wt.zsh for zsh) next to the real wtx script,
+  following symlinks. Other shells exit 2.
+
+push [TARGET]
+  Send THIS worktree's ($PWD) NEW gitignored config to TARGET.
+    SRC  = the worktree you're standing in ($PWD).
+    DST  = TARGET (a worktree path, branch name, or dir basename, resolved like
+           `rm`); omit it to send to the PRIMARY checkout (the hub).
+  This is the pre-teardown "save my config" step. Additive-only (never overwrites
+  or deletes), only what .worktreeinclude lists -- so it won't clobber a live .env.
+  Errors if SRC == DST (e.g. `push` while standing in the primary).
+  Examples:
+    cd ~/code/.worktrees/myapp/abc1  &&  wtx push        # abc1 -> primary
+    cd ~/code/.worktrees/myapp/abc1  &&  wtx push other  # abc1 -> worktree 'other'
+
+pull [SOURCE]
+  Bring SOURCE's NEW gitignored config INTO this worktree ($PWD).
+    SRC  = SOURCE (resolved like `rm`); omit it to pull from the PRIMARY checkout.
+    DST  = the worktree you're standing in ($PWD).
+  Additive-only, only what .worktreeinclude lists. Errors if SRC == DST.
+  Examples:
+    cd ~/code/.worktrees/myapp/abc1  &&  wtx pull        # primary -> abc1
+    cd ~/code/.worktrees/myapp/abc1  &&  wtx pull other  # worktree 'other' -> abc1
+
+rm NAME [-n] [-y] [-f]
+  Run from your primary checkout -- on main, master, or any branch -- just not
+  from inside the worktree being removed. NAME = branch, worktree path, or dir
+  basename (resolved via `git worktree list`). Branch deletion is gated on the
+  branch's work already being in HEAD -- either SHA-reachable (a normal "merged"
+  PR, or an unused branch) or squash/rebase-merged (detected by patch-equivalence).
+  Steps:
+    1. git worktree remove
+    2. delete the branch only if its work is in HEAD:
+         git branch -d   for a SHA-reachable merge
+         git branch -D   for a squash/rebase merge (-d would refuse it)
+    3. git worktree prune
+  Does NOT save config -- run `wtx push` first to preserve it.
+    -n, --dry-run  print the plan and exit; change nothing
+    -y, --yes      skip confirmation prompts
+    -f, --force    discard a dirty worktree on remove
+EOF
+}
+
+cmd="${1:-}"
+shift 2>/dev/null || true
+case "$cmd" in
+  new|push|pull)
+    _primary_for_keep="$(resolve_main_checkout)"
+    [ -n "$_primary_for_keep" ] && load_keep_patterns "$_primary_for_keep"
+    ;;
+esac
+case "$cmd" in
+  new)     do_new "$@" ;;
+  list)    do_list "$@" ;;
+  push)    do_push "$@" ;;
+  pull)    do_pull "$@" ;;
+  rm)      do_rm "$@" ;;
+  path)    do_path path "$@" ;;
+  cd)      do_path cd "$@" ;;
+  init)    do_init "$@" ;;
+  help|-h|--help) usage ;;
+  *)
+    echo "usage: wtx {new [BRANCH] | list | path [NAME] | cd [NAME] | push [TARGET] | pull [SOURCE] | rm NAME [-n] [-y] [-f] | init SHELL | help}" >&2
+    exit 1
+    ;;
+esac
