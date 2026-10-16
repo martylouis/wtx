@@ -29,6 +29,7 @@ wtx new [BRANCH]       # Create a worktree from current HEAD (or with auto name)
 wtx list               # Status table of all worktrees
 wtx cd [NAME]          # Jump to a worktree (fzf picker or numbered list)
 wtx rm NAME            # Tear down a worktree and delete its branch (if merged)
+wtx move NAME [DEST]   # Move a worktree (default: to $WTX_ROOT/<repo>/<branch>); reinstalls deps unless --no-install
 wtx push [TARGET]      # Send this worktree's config to TARGET (default: primary)
 wtx pull [SOURCE]      # Bring SOURCE's config into this worktree (default: primary)
 ```

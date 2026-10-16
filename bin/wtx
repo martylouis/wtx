@@ -70,6 +70,10 @@ set -u
 #                          -y/--yes skip prompts; -f/--force discard a dirty
 #                          worktree on remove. Refuses to touch the main checkout.
 #
+#   move NAME [DEST] Move one worktree (alias: mv) with `git worktree move`.
+#                   DEST omitted => $WTX_ROOT/<repo>/<branch>. Prints the new
+#                   path on stdout. Flags: -n/--dry-run.
+#
 # Generated artifacts (node_modules, dist, .turbo, ...) and OS/editor junk
 # (.DS_Store, Thumbs.db, desktop.ini, .directory) are skipped.
 #
@@ -511,6 +515,32 @@ detect_installer() {
   fi
 }
 
+# Echo the worktree root: $WTX_ROOT, else $WORKTREE_ROOT, else the default.
+# A leading ~ is expanded.
+worktree_root() {
+  local root="${WTX_ROOT:-${WORKTREE_ROOT:-$HOME/code/.worktrees}}"
+  printf '%s\n' "${root/#\~/$HOME}"
+}
+
+# Echo where the root came from, for dry-run plans.
+# The $VARS are literal labels.
+# shellcheck disable=SC2016
+worktree_root_source() {
+  if   [ -n "${WTX_ROOT:-}" ];      then echo '(from $WTX_ROOT)'
+  elif [ -n "${WORKTREE_ROOT:-}" ]; then echo '(from $WORKTREE_ROOT)'
+  else echo '(default)'
+  fi
+}
+
+# Refuse to nest a worktree inside the repo it forks from (e.g. a stray
+# WORKTREE_ROOT="$PWD/.worktrees" set from inside the repo).
+check_root_outside() {
+  local verb="$1" root="$2" dest="$3" main="$4"
+  case "$dest/" in
+    "$main"/*) echo "wtx $verb: worktree root '$root' is inside the main checkout '$main' -- pick a root outside the repo." >&2; exit 1 ;;
+  esac
+}
+
 do_new() {
   local BRANCH="" DRY_RUN=0 NO_SEED=0 NO_INSTALL=0 a
   for a in "$@"; do
@@ -541,16 +571,10 @@ do_new() {
 
   local REPO ROOT DEST_DIR explicit NAME
   REPO="$(basename "$MAIN")"
-  ROOT="${WTX_ROOT:-${WORKTREE_ROOT:-$HOME/code/.worktrees}}"
-  ROOT="${ROOT/#\~/$HOME}"
+  ROOT="$(worktree_root)"
   DEST_DIR="$ROOT/$REPO"
   if [ -n "$BRANCH" ]; then explicit=1; NAME="$BRANCH"; else explicit=0; NAME="$(gen_name)"; fi
-
-  # Refuse to nest the worktree inside the repo it forks from (e.g. a stray
-  # WORKTREE_ROOT="$PWD/.worktrees" set from inside the repo).
-  case "$DEST_DIR/" in
-    "$MAIN"/*) echo "wtx new: worktree root '$ROOT' is inside the main checkout '$MAIN' -- pick a root outside the repo." >&2; exit 1 ;;
-  esac
+  check_root_outside new "$ROOT" "$DEST_DIR" "$MAIN"
 
   # Dry run: print the plan to stderr, change nothing, emit no stdout path.
   if [ "$DRY_RUN" = 1 ]; then
@@ -562,7 +586,7 @@ do_new() {
       echo "  main checkout: $MAIN"
       echo "  repo:          $REPO"
       echo "  source ref:    $SRC_REF"
-      echo "  worktree root: $ROOT$([ -n "${WTX_ROOT:-}" ] && echo '  (from $WTX_ROOT)' || ([ -n "${WORKTREE_ROOT:-}" ] && echo '  (from $WORKTREE_ROOT)' || echo '  (default)'))"
+      echo "  worktree root: $ROOT  $(worktree_root_source)"
       echo "  branch:        $NAME$([ "$explicit" = 0 ] && echo '  (auto; final name may differ on collision)')"
       echo "  worktree:      $DEST_DIR/$NAME"
       echo "  seed:          $([ "$NO_SEED" = 1 ] && echo 'skip (--no-seed)' || echo "seed gitignored config from main")"
@@ -612,6 +636,124 @@ do_new() {
 
   # The ONLY stdout line: the new worktree path (the `wtx` function cd's here).
   echo "$WT_PATH"
+}
+
+# --- move --------------------------------------------------------------------
+
+# Move one worktree to DEST, or to $WTX_ROOT/<repo>/<branch> when DEST is
+# omitted. Prints the new path on stdout (the `wtx` shell function cd's there
+# if you stood inside the old path); all other output goes to stderr.
+do_move() {
+  local target="" DEST="" DRY_RUN=0 NO_INSTALL=0 a
+  for a in "$@"; do
+    case "$a" in
+      -n|--dry-run) DRY_RUN=1 ;;
+      --no-install) NO_INSTALL=1 ;;
+      -*)           echo "wtx move: unknown flag: $a" >&2; exit 1 ;;
+      *)
+        if   [ -z "$target" ]; then target="$a"
+        elif [ -z "$DEST" ];   then DEST="$a"
+        else echo "wtx move: unexpected arg: $a" >&2; exit 1
+        fi ;;
+    esac
+  done
+  if [ -z "$target" ]; then
+    echo "usage: wtx move NAME [DEST] [-n] [--no-install]" >&2
+    exit 1
+  fi
+
+  local MAIN
+  MAIN="$(resolve_main_checkout)"
+  if [ -z "$MAIN" ]; then
+    echo "wtx move: not in a git repo (no worktree found)." >&2
+    exit 1
+  fi
+
+  local resolved WT_PATH BRANCH
+  resolved="$(resolve_worktree "$target")" || {
+    echo "wtx move: no worktree matches '$target'. Known worktrees:" >&2
+    git worktree list >&2
+    exit 1
+  }
+  WT_PATH="${resolved%%$'\t'*}"
+  BRANCH="${resolved#*$'\t'}"
+  if [ "$WT_PATH" = "$MAIN" ]; then
+    echo "wtx move: '$WT_PATH' is the main checkout -- it cannot be moved." >&2
+    exit 1
+  fi
+
+  local ROOT="" SRC_LABEL="(given)"
+  if [ -z "$DEST" ]; then
+    if [ -z "$BRANCH" ]; then
+      echo "wtx move: '$WT_PATH' is detached -- give a DEST path." >&2
+      exit 1
+    fi
+    ROOT="$(worktree_root)"
+    SRC_LABEL="$(worktree_root_source)"
+    DEST="$ROOT/$(basename "$MAIN")/$BRANCH"
+    check_root_outside move "$ROOT" "$DEST" "$MAIN"
+  fi
+  DEST="${DEST/#\~/$HOME}"
+  case "$DEST" in /*) ;; *) DEST="$PWD/$DEST" ;; esac
+  DEST="${DEST%/}"
+  case "$DEST/" in
+    "$MAIN"/*) echo "wtx move: '$DEST' is inside the main checkout '$MAIN' -- pick a path outside the repo." >&2; exit 1 ;;
+  esac
+
+  if [ "$DEST" = "$WT_PATH" ]; then
+    echo "wtx move: '$WT_PATH' is already at that path." >&2
+    echo "$WT_PATH"
+    exit 0
+  fi
+  if [ -e "$DEST" ]; then
+    echo "wtx move: '$DEST' already exists -- remove it or pick another path." >&2
+    exit 1
+  fi
+
+  # The lockfile is read from the worktree being moved: the new path does not
+  # exist yet, and the main checkout can be on another branch with another tool.
+  local inst=""
+  if [ "$NO_INSTALL" != 1 ]; then
+    inst="$(detect_installer "$WT_PATH")"
+  fi
+
+  if [ "$DRY_RUN" = 1 ]; then
+    {
+      echo "wtx move -- plan:"
+      echo "  from: $WT_PATH"
+      echo "  to:   $DEST  $SRC_LABEL"
+      echo "  install: $([ "$NO_INSTALL" = 1 ] && echo 'skip (--no-install)' || echo "${inst:-skip (no lockfile)}")"
+      echo "(dry run: nothing changed)"
+    } >&2
+    exit 0
+  fi
+
+  mkdir -p "$(dirname "$DEST")" || exit 1
+  # git refuses a locked worktree or one with submodules; its error says why.
+  git -C "$MAIN" worktree move "$WT_PATH" "$DEST" >&2 || {
+    echo "wtx move: git worktree move failed (locked worktree or submodules? see above)." >&2
+    exit 1
+  }
+  echo "moved worktree: $WT_PATH -> $DEST" >&2
+
+  # Remove parent dirs that the move left empty (e.g. <root>/<repo>/feat/).
+  local parent; parent="$(dirname "$WT_PATH")"
+  while [ "$parent" != "/" ] && rmdir "$parent" 2>/dev/null; do
+    parent="$(dirname "$parent")"
+  done
+
+  if [ -f "$DEST/.envrc" ] && command -v direnv >/dev/null 2>&1; then
+    echo "note: $DEST/.envrc is at a new path -- run 'direnv allow' there." >&2
+  fi
+  if [ -n "$inst" ]; then
+    echo "running: $inst (in $DEST)" >&2
+    ( cd "$DEST" && $inst ) >&2
+  elif [ "$NO_INSTALL" = 1 ]; then
+    echo "note: tools that store absolute paths (node_modules, build caches) may need a reinstall." >&2
+  fi
+
+  # The ONLY stdout line: the new worktree path.
+  echo "$DEST"
 }
 
 # --- list --------------------------------------------------------------------
@@ -960,6 +1102,7 @@ USAGE
   wtx push [TARGET]                send THIS worktree's config to TARGET (default: primary)
   wtx pull [SOURCE]                bring SOURCE's config into THIS worktree (default: primary)
   wtx rm NAME [-n] [-y] [-f]       post-merge teardown of one worktree
+  wtx move NAME [DEST] [-n] [--no-install]  move a worktree (alias: mv)
   wtx init SHELL                   print shell setup code (zsh | bash)
   wtx help | -h | --help           show this help
 
@@ -1051,6 +1194,20 @@ pull [SOURCE]
     cd ~/code/.worktrees/myapp/abc1  &&  wtx pull        # primary -> abc1
     cd ~/code/.worktrees/myapp/abc1  &&  wtx pull other  # worktree 'other' -> abc1
 
+move NAME [DEST] [-n] [--no-install]   (alias: mv)
+  Move one worktree with `git worktree move`. NAME is resolved like `rm`.
+  DEST omitted => $WTX_ROOT/<repo>/<branch>, the path `wtx new` would use now;
+  this fixes a worktree made with the wrong root. Refuses the main checkout, a
+  detached worktree without DEST, a DEST that exists, and a DEST inside the
+  main checkout. git itself refuses locked worktrees and worktrees with
+  submodules. Empty parent dirs left at the old path are removed.
+  Prints the new path on stdout (the `wtx` shell function cd's you there if
+  you stood inside the old path).
+    -n, --dry-run  print the plan and exit; change nothing
+    --no-install   skip the dependency install. By default, after the move, wtx
+                   runs the installer for the lockfile found in the worktree
+                   (pnpm, npm, yarn or bun), as `new` does
+
 rm NAME [-n] [-y] [-f]
   Run from your primary checkout -- on main, master, or any branch -- just not
   from inside the worktree being removed. NAME = branch, worktree path, or dir
@@ -1084,12 +1241,13 @@ case "$cmd" in
   push)    do_push "$@" ;;
   pull)    do_pull "$@" ;;
   rm)      do_rm "$@" ;;
+  move|mv) do_move "$@" ;;
   path)    do_path path "$@" ;;
   cd)      do_path cd "$@" ;;
   init)    do_init "$@" ;;
   help|-h|--help) usage ;;
   *)
-    echo "usage: wtx {new [BRANCH] | list | path [NAME] | cd [NAME] | push [TARGET] | pull [SOURCE] | rm NAME [-n] [-y] [-f] | init SHELL | help}" >&2
+    echo "usage: wtx {new [BRANCH] | list | path [NAME] | cd [NAME] | push [TARGET] | pull [SOURCE] | rm NAME [-n] [-y] [-f] | move NAME [DEST] [-n] [--no-install] | init SHELL | help}" >&2
     exit 1
     ;;
 esac
