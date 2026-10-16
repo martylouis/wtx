@@ -35,6 +35,9 @@ _wt() {
 	new)
 		compadd -- -n --dry-run --no-seed --no-install
 		;;
+	move | mv)
+		(( CURRENT > 3 )) && compadd -- -n --dry-run --no-install
+		;;
 	esac
 	return 0
 }

@@ -644,10 +644,11 @@ do_new() {
 # omitted. Prints the new path on stdout (the `wtx` shell function cd's there
 # if you stood inside the old path); all other output goes to stderr.
 do_move() {
-  local target="" DEST="" DRY_RUN=0 a
+  local target="" DEST="" DRY_RUN=0 NO_INSTALL=0 a
   for a in "$@"; do
     case "$a" in
       -n|--dry-run) DRY_RUN=1 ;;
+      --no-install) NO_INSTALL=1 ;;
       -*)           echo "wtx move: unknown flag: $a" >&2; exit 1 ;;
       *)
         if   [ -z "$target" ]; then target="$a"
@@ -657,7 +658,7 @@ do_move() {
     esac
   done
   if [ -z "$target" ]; then
-    echo "usage: wtx move NAME [DEST] [-n]" >&2
+    echo "usage: wtx move NAME [DEST] [-n] [--no-install]" >&2
     exit 1
   fi
 
@@ -709,11 +710,19 @@ do_move() {
     exit 1
   fi
 
+  # The lockfile is read from the worktree being moved: the new path does not
+  # exist yet, and the main checkout can be on another branch with another tool.
+  local inst=""
+  if [ "$NO_INSTALL" != 1 ]; then
+    inst="$(detect_installer "$WT_PATH")"
+  fi
+
   if [ "$DRY_RUN" = 1 ]; then
     {
       echo "wtx move -- plan:"
       echo "  from: $WT_PATH"
       echo "  to:   $DEST  $SRC_LABEL"
+      echo "  install: $([ "$NO_INSTALL" = 1 ] && echo 'skip (--no-install)' || echo "${inst:-skip (no lockfile)}")"
       echo "(dry run: nothing changed)"
     } >&2
     exit 0
@@ -736,7 +745,12 @@ do_move() {
   if [ -f "$DEST/.envrc" ] && command -v direnv >/dev/null 2>&1; then
     echo "note: $DEST/.envrc is at a new path -- run 'direnv allow' there." >&2
   fi
-  echo "note: tools that store absolute paths (node_modules, build caches) may need a reinstall." >&2
+  if [ -n "$inst" ]; then
+    echo "running: $inst (in $DEST)" >&2
+    ( cd "$DEST" && $inst ) >&2
+  elif [ "$NO_INSTALL" = 1 ]; then
+    echo "note: tools that store absolute paths (node_modules, build caches) may need a reinstall." >&2
+  fi
 
   # The ONLY stdout line: the new worktree path.
   echo "$DEST"
@@ -1088,7 +1102,7 @@ USAGE
   wtx push [TARGET]                send THIS worktree's config to TARGET (default: primary)
   wtx pull [SOURCE]                bring SOURCE's config into THIS worktree (default: primary)
   wtx rm NAME [-n] [-y] [-f]       post-merge teardown of one worktree
-  wtx move NAME [DEST] [-n]        move a worktree (alias: mv)
+  wtx move NAME [DEST] [-n] [--no-install]  move a worktree (alias: mv)
   wtx init SHELL                   print shell setup code (zsh | bash)
   wtx help | -h | --help           show this help
 
@@ -1180,7 +1194,7 @@ pull [SOURCE]
     cd ~/code/.worktrees/myapp/abc1  &&  wtx pull        # primary -> abc1
     cd ~/code/.worktrees/myapp/abc1  &&  wtx pull other  # worktree 'other' -> abc1
 
-move NAME [DEST] [-n]   (alias: mv)
+move NAME [DEST] [-n] [--no-install]   (alias: mv)
   Move one worktree with `git worktree move`. NAME is resolved like `rm`.
   DEST omitted => $WTX_ROOT/<repo>/<branch>, the path `wtx new` would use now;
   this fixes a worktree made with the wrong root. Refuses the main checkout, a
@@ -1190,6 +1204,9 @@ move NAME [DEST] [-n]   (alias: mv)
   Prints the new path on stdout (the `wtx` shell function cd's you there if
   you stood inside the old path).
     -n, --dry-run  print the plan and exit; change nothing
+    --no-install   skip the dependency install. By default, after the move, wtx
+                   runs the installer for the lockfile found in the worktree
+                   (pnpm, npm, yarn or bun), as `new` does
 
 rm NAME [-n] [-y] [-f]
   Run from your primary checkout -- on main, master, or any branch -- just not
@@ -1230,7 +1247,7 @@ case "$cmd" in
   init)    do_init "$@" ;;
   help|-h|--help) usage ;;
   *)
-    echo "usage: wtx {new [BRANCH] | list | path [NAME] | cd [NAME] | push [TARGET] | pull [SOURCE] | rm NAME [-n] [-y] [-f] | move NAME [DEST] [-n] | init SHELL | help}" >&2
+    echo "usage: wtx {new [BRANCH] | list | path [NAME] | cd [NAME] | push [TARGET] | pull [SOURCE] | rm NAME [-n] [-y] [-f] | move NAME [DEST] [-n] [--no-install] | init SHELL | help}" >&2
     exit 1
     ;;
 esac

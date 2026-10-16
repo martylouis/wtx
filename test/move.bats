@@ -78,3 +78,39 @@ load test_helper
   wtx move feat-one 2>/dev/null
   [ "$PWD" = "$REPO" ]
 }
+
+@test "move runs the installer from the lockfile, in the new path" {
+  "$WTX" new feat-one --no-install >/dev/null 2>&1
+  touch "$TEST_TMP/worktrees/repo/feat-one/package-lock.json"
+  mkdir -p "$TEST_TMP/bin"
+  printf '#!/bin/sh\npwd > "%s/npm.ran"\n' "$TEST_TMP" > "$TEST_TMP/bin/npm"
+  chmod +x "$TEST_TMP/bin/npm"
+  export PATH="$TEST_TMP/bin:$PATH"
+  export WTX_ROOT="$TEST_TMP/other"
+  run "$WTX" move feat-one
+  [ "$status" -eq 0 ]
+  [ "$(cat "$TEST_TMP/npm.ran")" = "$TEST_TMP/other/repo/feat-one" ]
+}
+
+@test "move --no-install does not run the installer" {
+  "$WTX" new feat-one --no-install >/dev/null 2>&1
+  touch "$TEST_TMP/worktrees/repo/feat-one/package-lock.json"
+  mkdir -p "$TEST_TMP/bin"
+  printf '#!/bin/sh\ntouch "%s/npm.ran"\n' "$TEST_TMP" > "$TEST_TMP/bin/npm"
+  chmod +x "$TEST_TMP/bin/npm"
+  export PATH="$TEST_TMP/bin:$PATH"
+  export WTX_ROOT="$TEST_TMP/other"
+  run "$WTX" move feat-one --no-install
+  [ "$status" -eq 0 ]
+  [ ! -e "$TEST_TMP/npm.ran" ]
+}
+
+@test "move --dry-run shows the installer and runs nothing" {
+  "$WTX" new feat-one --no-install >/dev/null 2>&1
+  touch "$TEST_TMP/worktrees/repo/feat-one/pnpm-lock.yaml"
+  export WTX_ROOT="$TEST_TMP/other"
+  run "$WTX" move feat-one --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"install: pnpm install"* ]]
+  [ -d "$TEST_TMP/worktrees/repo/feat-one" ]
+}
