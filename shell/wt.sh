@@ -30,6 +30,15 @@ wtx() {
 			cd "$target" || return
 		fi
 		;;
+	move | mv)
+		# If you stood inside the old path, it is gone now: cd to the new one.
+		target="$(command wtx "$@")"
+		rc=$?
+		[ "$rc" -eq 0 ] || return "$rc"
+		if [ -n "$target" ] && [ -d "$target" ] && [ ! -d "$PWD" ]; then
+			cd "$target" || return
+		fi
+		;;
 	*)
 		command wtx "$@"
 		;;
