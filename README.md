@@ -1,6 +1,6 @@
 # wtx
 
-Manage git worktrees from one place: create, list, jump to, and remove them. Works well with direnv, because `WTX_ROOT` can be set per environment.
+Manage git worktrees from one place: create, list, jump to, and remove them. Works well with [direnv](https://github.com/direnv/direnv), because `WTX_ROOT` can be set per environment.
 
 ## Install
 
@@ -56,6 +56,19 @@ wtx pull [SOURCE]      # Bring SOURCE's config into this worktree (default: prim
 
 **`NO_COLOR`**
 - Set to any value to disable colored output: `NO_COLOR=1 wtx list`
+
+## Using with direnv
+
+[direnv](https://github.com/direnv/direnv) loads and unloads environment variables when you go into or out of a directory. Use it to set `WTX_ROOT` for each project.
+
+1. Install direnv and add its hook to your shell. Refer to the [direnv install guide](https://github.com/direnv/direnv/blob/master/docs/installation.md).
+2. Put an `.envrc` file in the folder that holds your repo, for example `~/code/project-a/.envrc`:
+   ```bash
+   export WTX_ROOT="$HOME/code/.worktrees/project-a"
+   ```
+3. Run `direnv allow` in that folder.
+
+With the default `WTX_ROOT`, worktrees go in `.worktrees` next to the repo. Thus the repo and all its worktrees are below the same parent folder, and direnv loads the same `.envrc` in each of them.
 
 ## Requirements
 
