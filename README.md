@@ -1,6 +1,6 @@
 # wtx
 
-Manage git worktrees from one place: create, list, jump to, and remove them. Each worktree goes in its own repo, at `<repo>/.worktrees/<branch>`, so direnv loads the repo's `.envrc` in the worktree too.
+Manage git worktrees from one place: create, list, jump to, and remove them. Works well with direnv, because `WTX_ROOT` can be set per environment.
 
 ## Install
 
@@ -29,18 +29,17 @@ wtx new [BRANCH]       # Create a worktree from current HEAD (or with auto name)
 wtx list               # Status table of all worktrees
 wtx cd [NAME]          # Jump to a worktree (fzf picker or numbered list)
 wtx rm NAME            # Tear down a worktree and delete its branch (if merged)
-wtx move NAME [DEST]   # Move a worktree (default: to <repo>/.worktrees/<branch>); reinstalls deps unless --no-install
+wtx move NAME [DEST]   # Move a worktree (default: to $WTX_ROOT/<repo>/<branch>); reinstalls deps unless --no-install
 wtx push [TARGET]      # Send this worktree's config to TARGET (default: primary)
 wtx pull [SOURCE]      # Bring SOURCE's config into this worktree (default: primary)
 ```
 
 ## Configuration
 
-**Worktree folder**
-- New worktrees go to `<repo>/.worktrees/<branch>`. There is no setting.
-- Add `.worktrees/` to your global gitignore (`git config --global core.excludesfile`), so `git status` in the main checkout does not show it.
-- `WTX_ROOT` and `WORKTREE_ROOT` are no longer read. To move an old worktree into the repo, run `wtx move NAME`.
-- `wtx move NAME DEST` can still put a worktree outside the repo.
+**`WTX_ROOT`** (environment variable)
+- Default: `.worktrees` in the repo's parent folder, for example `~/code/project-a/repo` → `~/code/project-a/.worktrees/repo/<branch>`. Thus no tool in the repo scans the worktrees, and direnv loads the same parent `.envrc`.
+- `WORKTREE_ROOT` is still read as a fallback for older setups
+- Set per-environment via direnv: `export WTX_ROOT="$HOME/code/.worktrees/myproject"`
 
 **`.worktreeinclude`** (gitignored file in repo root)
 - One gitignore-style pattern per line (`#` comments ok)

@@ -4,13 +4,13 @@ load test_helper
   "$WTX" new feat-one --no-install >/dev/null 2>&1
   "$WTX" new feat-two --no-install >/dev/null 2>&1
   out="$("$WTX" path feat-one)"
-  [ "$out" = "$WT/feat-one" ]
+  [ "$out" = "$WTX_ROOT/repo/feat-one" ]
 }
 
 @test "path NAME accepts a substring match" {
   "$WTX" new feat-unique-xyz --no-install >/dev/null 2>&1
   out="$("$WTX" path unique)"
-  [ "$out" = "$WT/feat-unique-xyz" ]
+  [ "$out" = "$WTX_ROOT/repo/feat-unique-xyz" ]
 }
 
 @test "path with no match exits 1 with an error on stderr" {
@@ -37,5 +37,5 @@ load test_helper
   a="$("$WTX" cd feat-one)"
   b="$("$WTX" path feat-one)"
   [ "$a" = "$b" ]
-  [ "$a" = "$WT/feat-one" ]
+  [ "$a" = "$WTX_ROOT/repo/feat-one" ]
 }

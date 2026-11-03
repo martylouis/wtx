@@ -23,13 +23,13 @@ load test_helper
   "$WTX" new feat-one --no-install >/dev/null 2>&1
   eval "$("$WTX" init bash)"
   wtx cd feat-one
-  [ "$PWD" = "$WT/feat-one" ]
+  [ "$PWD" = "$WTX_ROOT/repo/feat-one" ]
 }
 
 @test "wtx new changes into the new worktree" {
   eval "$("$WTX" init bash)"
   wtx new feat-two --no-install 2>/dev/null
-  [ "$PWD" = "$WT/feat-two" ]
+  [ "$PWD" = "$WTX_ROOT/repo/feat-two" ]
 }
 
 @test "wtx cd with no match keeps the directory and returns 1" {

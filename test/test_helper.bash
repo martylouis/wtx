@@ -13,6 +13,8 @@ setup() {
   TEST_TMP="$(cd "$BATS_TEST_TMPDIR" && pwd -P)"
   export HOME="$TEST_TMP/home"
   mkdir -p "$HOME"
+  export WTX_ROOT="$TEST_TMP/worktrees"
+  unset WORKTREE_ROOT
   export NO_COLOR=1
   export GIT_CONFIG_GLOBAL=/dev/null
   export GIT_CONFIG_SYSTEM=/dev/null
@@ -31,12 +33,9 @@ setup() {
   WTX="$TEST_TMP/bin/wtx"
 
   REPO="$TEST_TMP/repo"
-  WT="$REPO/.worktrees"
   mkdir -p "$REPO"
   cd "$REPO" || return 1
   git init -q
-  # Like the global gitignore entry the README asks for.
-  echo ".worktrees/" >> .git/info/exclude
   git symbolic-ref HEAD refs/heads/main
   git config user.name "Test User"
   git config user.email "test@example.com"
