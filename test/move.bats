@@ -1,21 +1,29 @@
 load test_helper
 
-@test "move NAME moves the worktree to the current root" {
+@test "move NAME moves the worktree back to <repo>/.worktrees/<branch>" {
   "$WTX" new feat-one --no-install >/dev/null 2>&1
-  export WTX_ROOT="$TEST_TMP/other"
+  "$WTX" move feat-one "$TEST_TMP/other/repo/feat-one" >/dev/null 2>&1
+  [ ! -e "$WT/feat-one" ]
   out="$("$WTX" move feat-one 2>/dev/null)"
+  [ "$out" = "$WT/feat-one" ]
+  [ -d "$WT/feat-one" ]
+  [ ! -e "$TEST_TMP/other/repo/feat-one" ]
+}
+
+@test "move NAME DEST moves the worktree out of the repo" {
+  "$WTX" new feat-one --no-install >/dev/null 2>&1
+  out="$("$WTX" move feat-one "$TEST_TMP/other/repo/feat-one" 2>/dev/null)"
   [ "$out" = "$TEST_TMP/other/repo/feat-one" ]
   [ -d "$TEST_TMP/other/repo/feat-one" ]
-  [ ! -e "$TEST_TMP/worktrees/repo/feat-one" ]
+  [ ! -e "$WT/feat-one" ]
   git worktree list | grep -q "$TEST_TMP/other/repo/feat-one"
 }
 
 @test "move removes empty parent dirs at the old path" {
   "$WTX" new feat/nested --no-install >/dev/null 2>&1
-  export WTX_ROOT="$TEST_TMP/other"
-  "$WTX" move feat/nested >/dev/null 2>&1
+  "$WTX" move feat/nested "$TEST_TMP/other/repo/feat/nested" >/dev/null 2>&1
   [ -d "$TEST_TMP/other/repo/feat/nested" ]
-  [ ! -e "$TEST_TMP/worktrees/repo/feat" ]
+  [ ! -e "$WT/feat" ]
 }
 
 @test "move NAME DEST moves the worktree to DEST" {
@@ -27,11 +35,10 @@ load test_helper
 
 @test "move --dry-run changes nothing" {
   "$WTX" new feat-one --no-install >/dev/null 2>&1
-  export WTX_ROOT="$TEST_TMP/other"
-  run "$WTX" move feat-one --dry-run
+  run "$WTX" move feat-one "$TEST_TMP/other/repo/feat-one" --dry-run
   [ "$status" -eq 0 ]
   [[ "$output" == *"plan"* ]]
-  [ -d "$TEST_TMP/worktrees/repo/feat-one" ]
+  [ -d "$WT/feat-one" ]
   [ ! -e "$TEST_TMP/other" ]
 }
 
@@ -41,7 +48,7 @@ load test_helper
   run "$WTX" move feat-one "$TEST_TMP/taken"
   [ "$status" -eq 1 ]
   [[ "$output" == *"already exists"* ]]
-  [ -d "$TEST_TMP/worktrees/repo/feat-one" ]
+  [ -d "$WT/feat-one" ]
 }
 
 @test "move refuses the main checkout" {
@@ -50,10 +57,9 @@ load test_helper
   [[ "$output" == *"main checkout"* ]]
 }
 
-@test "move refuses a root inside the main checkout" {
+@test "move refuses a DEST inside the main checkout but outside .worktrees" {
   "$WTX" new feat-one --no-install >/dev/null 2>&1
-  export WTX_ROOT="$REPO/.worktrees"
-  run "$WTX" move feat-one
+  run "$WTX" move feat-one "$REPO/src/feat-one"
   [ "$status" -eq 1 ]
   [[ "$output" == *"inside the main checkout"* ]]
 }
@@ -66,51 +72,46 @@ load test_helper
 @test "wtx move cds to the new path when you stood inside the old one" {
   eval "$("$WTX" init bash)"
   wtx new feat-one --no-install 2>/dev/null
-  export WTX_ROOT="$TEST_TMP/other"
-  wtx move feat-one 2>/dev/null
+  wtx move feat-one "$TEST_TMP/other/repo/feat-one" 2>/dev/null
   [ "$PWD" = "$TEST_TMP/other/repo/feat-one" ]
 }
 
 @test "wtx move keeps the directory when you stood outside the worktree" {
   "$WTX" new feat-one --no-install >/dev/null 2>&1
   eval "$("$WTX" init bash)"
-  export WTX_ROOT="$TEST_TMP/other"
-  wtx move feat-one 2>/dev/null
+  wtx move feat-one "$TEST_TMP/other/repo/feat-one" 2>/dev/null
   [ "$PWD" = "$REPO" ]
 }
 
 @test "move runs the installer from the lockfile, in the new path" {
   "$WTX" new feat-one --no-install >/dev/null 2>&1
-  touch "$TEST_TMP/worktrees/repo/feat-one/package-lock.json"
+  touch "$WT/feat-one/package-lock.json"
   mkdir -p "$TEST_TMP/bin"
   printf '#!/bin/sh\npwd > "%s/npm.ran"\n' "$TEST_TMP" > "$TEST_TMP/bin/npm"
   chmod +x "$TEST_TMP/bin/npm"
   export PATH="$TEST_TMP/bin:$PATH"
-  export WTX_ROOT="$TEST_TMP/other"
-  run "$WTX" move feat-one
+  run "$WTX" move feat-one "$TEST_TMP/other/repo/feat-one"
   [ "$status" -eq 0 ]
   [ "$(cat "$TEST_TMP/npm.ran")" = "$TEST_TMP/other/repo/feat-one" ]
 }
 
 @test "move --no-install does not run the installer" {
   "$WTX" new feat-one --no-install >/dev/null 2>&1
-  touch "$TEST_TMP/worktrees/repo/feat-one/package-lock.json"
+  touch "$WT/feat-one/package-lock.json"
   mkdir -p "$TEST_TMP/bin"
   printf '#!/bin/sh\ntouch "%s/npm.ran"\n' "$TEST_TMP" > "$TEST_TMP/bin/npm"
   chmod +x "$TEST_TMP/bin/npm"
   export PATH="$TEST_TMP/bin:$PATH"
-  export WTX_ROOT="$TEST_TMP/other"
-  run "$WTX" move feat-one --no-install
+  run "$WTX" move feat-one "$TEST_TMP/other/repo/feat-one" --no-install
   [ "$status" -eq 0 ]
   [ ! -e "$TEST_TMP/npm.ran" ]
 }
 
 @test "move --dry-run shows the installer and runs nothing" {
   "$WTX" new feat-one --no-install >/dev/null 2>&1
-  touch "$TEST_TMP/worktrees/repo/feat-one/pnpm-lock.yaml"
-  export WTX_ROOT="$TEST_TMP/other"
-  run "$WTX" move feat-one --dry-run
+  touch "$WT/feat-one/pnpm-lock.yaml"
+  run "$WTX" move feat-one "$TEST_TMP/other/repo/feat-one" --dry-run
   [ "$status" -eq 0 ]
   [[ "$output" == *"install: pnpm install"* ]]
-  [ -d "$TEST_TMP/worktrees/repo/feat-one" ]
+  [ -d "$WT/feat-one" ]
 }

@@ -12,7 +12,7 @@ set -u
 # additive -- they never overwrite or delete, so they can't clobber a live .env.
 #
 # Subcommands:
-#   new [BRANCH]    Create a worktree under $WTX_ROOT/<repo>/<branch> from
+#   new [BRANCH]    Create a worktree under <repo>/.worktrees/<branch> from
 #                   current HEAD, then seed gitignored config from the primary
 #                   checkout (overwriting -- the new plot is empty) and install
 #                   deps. BRANCH omitted => auto name YY-MM-DD-<modifier>-<fish>.
@@ -71,7 +71,7 @@ set -u
 #                          worktree on remove. Refuses to touch the main checkout.
 #
 #   move NAME [DEST] Move one worktree (alias: mv) with `git worktree move`.
-#                   DEST omitted => $WTX_ROOT/<repo>/<branch>. Prints the new
+#                   DEST omitted => <repo>/.worktrees/<branch>. Prints the new
 #                   path on stdout. Flags: -n/--dry-run.
 #
 # Generated artifacts (node_modules, dist, .turbo, ...) and OS/editor junk
@@ -151,7 +151,7 @@ matches_keep() {
 is_allowed() {
   local rel="${1%/}"
   case "/$rel/" in
-    */node_modules/*|*/dist/*|*/.turbo/*|*/.next/*|*/build/*|*/.git/*) return 1 ;;
+    */.worktrees/*|*/node_modules/*|*/dist/*|*/.turbo/*|*/.next/*|*/build/*|*/.git/*) return 1 ;;
   esac
   # A stray ignored file (e.g. .DS_Store) sitting next to tracked files -- not
   # collapsed into a directory entry by `ls-files --directory` -- can still get
@@ -213,7 +213,7 @@ sync_config() {
   while IFS= read -r -d '' rel; do
     # Backstop: never copy from a node_modules dir at any depth (a dependency
     # shipping its own config is not our config).
-    case "/$rel/" in */node_modules/*) continue ;; esac
+    case "/$rel/" in */node_modules/*|/.worktrees/*) continue ;; esac
     is_allowed "$rel" || continue
     # Additive-only: never overwrite a file that already exists in DST.
     [ -e "$DST/$rel" ] && continue
@@ -229,7 +229,7 @@ sync_config() {
       echo "FAILED: $rel (rsync exit $rc)"
     fi
   done < <(git -C "$SRC" ls-files --others --ignored --exclude-standard -z \
-             -- . ':(exclude)**/node_modules/**')
+             -- . ':(exclude)**/node_modules/**' ':(exclude).worktrees/**')
 
   echo "---"
   echo "copied $copied new path(s) into $DST"
@@ -515,30 +515,11 @@ detect_installer() {
   fi
 }
 
-# Echo the worktree root: $WTX_ROOT, else $WORKTREE_ROOT, else the default.
-# A leading ~ is expanded.
+# Echo the worktree root for the main checkout $1: <main>/.worktrees.
+# Every worktree lives in its own repo, so direnv loads the repo's .envrc.
+# Add `.worktrees/` to your global gitignore.
 worktree_root() {
-  local root="${WTX_ROOT:-${WORKTREE_ROOT:-$HOME/code/.worktrees}}"
-  printf '%s\n' "${root/#\~/$HOME}"
-}
-
-# Echo where the root came from, for dry-run plans.
-# The $VARS are literal labels.
-# shellcheck disable=SC2016
-worktree_root_source() {
-  if   [ -n "${WTX_ROOT:-}" ];      then echo '(from $WTX_ROOT)'
-  elif [ -n "${WORKTREE_ROOT:-}" ]; then echo '(from $WORKTREE_ROOT)'
-  else echo '(default)'
-  fi
-}
-
-# Refuse to nest a worktree inside the repo it forks from (e.g. a stray
-# WORKTREE_ROOT="$PWD/.worktrees" set from inside the repo).
-check_root_outside() {
-  local verb="$1" root="$2" dest="$3" main="$4"
-  case "$dest/" in
-    "$main"/*) echo "wtx $verb: worktree root '$root' is inside the main checkout '$main' -- pick a root outside the repo." >&2; exit 1 ;;
-  esac
+  printf '%s/.worktrees\n' "$1"
 }
 
 do_new() {
@@ -571,10 +552,9 @@ do_new() {
 
   local REPO ROOT DEST_DIR explicit NAME
   REPO="$(basename "$MAIN")"
-  ROOT="$(worktree_root)"
-  DEST_DIR="$ROOT/$REPO"
+  ROOT="$(worktree_root "$MAIN")"
+  DEST_DIR="$ROOT"
   if [ -n "$BRANCH" ]; then explicit=1; NAME="$BRANCH"; else explicit=0; NAME="$(gen_name)"; fi
-  check_root_outside new "$ROOT" "$DEST_DIR" "$MAIN"
 
   # Dry run: print the plan to stderr, change nothing, emit no stdout path.
   if [ "$DRY_RUN" = 1 ]; then
@@ -586,7 +566,7 @@ do_new() {
       echo "  main checkout: $MAIN"
       echo "  repo:          $REPO"
       echo "  source ref:    $SRC_REF"
-      echo "  worktree root: $ROOT  $(worktree_root_source)"
+      echo "  worktree root: $ROOT"
       echo "  branch:        $NAME$([ "$explicit" = 0 ] && echo '  (auto; final name may differ on collision)')"
       echo "  worktree:      $DEST_DIR/$NAME"
       echo "  seed:          $([ "$NO_SEED" = 1 ] && echo 'skip (--no-seed)' || echo "seed gitignored config from main")"
@@ -640,7 +620,7 @@ do_new() {
 
 # --- move --------------------------------------------------------------------
 
-# Move one worktree to DEST, or to $WTX_ROOT/<repo>/<branch> when DEST is
+# Move one worktree to DEST, or to <repo>/.worktrees/<branch> when DEST is
 # omitted. Prints the new path on stdout (the `wtx` shell function cd's there
 # if you stood inside the old path); all other output goes to stderr.
 do_move() {
@@ -682,22 +662,21 @@ do_move() {
     exit 1
   fi
 
-  local ROOT="" SRC_LABEL="(given)"
+  local SRC_LABEL="(given)"
   if [ -z "$DEST" ]; then
     if [ -z "$BRANCH" ]; then
       echo "wtx move: '$WT_PATH' is detached -- give a DEST path." >&2
       exit 1
     fi
-    ROOT="$(worktree_root)"
-    SRC_LABEL="$(worktree_root_source)"
-    DEST="$ROOT/$(basename "$MAIN")/$BRANCH"
-    check_root_outside move "$ROOT" "$DEST" "$MAIN"
+    SRC_LABEL="(default)"
+    DEST="$(worktree_root "$MAIN")/$BRANCH"
   fi
   DEST="${DEST/#\~/$HOME}"
   case "$DEST" in /*) ;; *) DEST="$PWD/$DEST" ;; esac
   DEST="${DEST%/}"
   case "$DEST/" in
-    "$MAIN"/*) echo "wtx move: '$DEST' is inside the main checkout '$MAIN' -- pick a path outside the repo." >&2; exit 1 ;;
+    "$MAIN"/.worktrees/?*) ;;
+    "$MAIN"/*) echo "wtx move: '$DEST' is inside the main checkout '$MAIN' -- use '$MAIN/.worktrees/' or a path outside the repo." >&2; exit 1 ;;
   esac
 
   if [ "$DEST" = "$WT_PATH" ]; then
@@ -1121,8 +1100,7 @@ MODEL
   worktrees like any other config. No file = nothing to seed/push/pull, silently.
 
 new [BRANCH]
-  Create a worktree at $WTX_ROOT/<repo>/<branch> (default ~/code/.worktrees;
-  $WORKTREE_ROOT is read as a fallback for older setups) with a new branch forked
+  Create a worktree at <repo>/.worktrees/<branch> with a new branch forked
   from current HEAD (refuses a detached HEAD), then seed gitignored config from
   the primary checkout (overwriting -- the plot is fresh) and install deps if a
   lockfile is present. <repo> and the seed source are resolved from the primary worktree, so
@@ -1182,8 +1160,8 @@ push [TARGET]
   or deletes), only what .worktreeinclude lists -- so it won't clobber a live .env.
   Errors if SRC == DST (e.g. `push` while standing in the primary).
   Examples:
-    cd ~/code/.worktrees/myapp/abc1  &&  wtx push        # abc1 -> primary
-    cd ~/code/.worktrees/myapp/abc1  &&  wtx push other  # abc1 -> worktree 'other'
+    cd ~/code/myapp/.worktrees/abc1  &&  wtx push        # abc1 -> primary
+    cd ~/code/myapp/.worktrees/abc1  &&  wtx push other  # abc1 -> worktree 'other'
 
 pull [SOURCE]
   Bring SOURCE's NEW gitignored config INTO this worktree ($PWD).
@@ -1191,12 +1169,12 @@ pull [SOURCE]
     DST  = the worktree you're standing in ($PWD).
   Additive-only, only what .worktreeinclude lists. Errors if SRC == DST.
   Examples:
-    cd ~/code/.worktrees/myapp/abc1  &&  wtx pull        # primary -> abc1
-    cd ~/code/.worktrees/myapp/abc1  &&  wtx pull other  # worktree 'other' -> abc1
+    cd ~/code/myapp/.worktrees/abc1  &&  wtx pull        # primary -> abc1
+    cd ~/code/myapp/.worktrees/abc1  &&  wtx pull other  # worktree 'other' -> abc1
 
 move NAME [DEST] [-n] [--no-install]   (alias: mv)
   Move one worktree with `git worktree move`. NAME is resolved like `rm`.
-  DEST omitted => $WTX_ROOT/<repo>/<branch>, the path `wtx new` would use now;
+  DEST omitted => <repo>/.worktrees/<branch>, the path `wtx new` would use now;
   this fixes a worktree made with the wrong root. Refuses the main checkout, a
   detached worktree without DEST, a DEST that exists, and a DEST inside the
   main checkout. git itself refuses locked worktrees and worktrees with
