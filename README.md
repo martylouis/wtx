@@ -37,7 +37,7 @@ wtx pull [SOURCE]      # Bring SOURCE's config into this worktree (default: prim
 ## Configuration
 
 **`WTX_ROOT`** (environment variable)
-- Default: `~/code/.worktrees`
+- Default: `.worktrees` in the repo's parent folder, for example `~/code/project-a/repo` → `~/code/project-a/.worktrees/repo/<branch>`. Thus no tool in the repo scans the worktrees, and direnv loads the same parent `.envrc`.
 - `WORKTREE_ROOT` is still read as a fallback for older setups
 - Set per-environment via direnv: `export WTX_ROOT="$HOME/code/.worktrees/myproject"`
 

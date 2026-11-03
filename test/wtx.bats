@@ -32,6 +32,13 @@ load test_helper
   [ -d "$out" ]
 }
 
+@test "new with no root set uses .worktrees in the repo's parent folder" {
+  unset WTX_ROOT WORKTREE_ROOT
+  out="$("$WTX" new feat-p --no-install 2>/dev/null)"
+  [ "$out" = "$TEST_TMP/.worktrees/repo/feat-p" ]
+  [ -d "$out" ]
+}
+
 @test "list shows the primary and the new worktree" {
   "$WTX" new feat-d --no-install >/dev/null 2>&1
   run "$WTX" list

@@ -515,10 +515,13 @@ detect_installer() {
   fi
 }
 
-# Echo the worktree root: $WTX_ROOT, else $WORKTREE_ROOT, else the default.
-# A leading ~ is expanded.
+# Echo the worktree root for the main checkout $1: $WTX_ROOT, else
+# $WORKTREE_ROOT, else .worktrees in the main checkout's parent folder
+# (~/code/a/repo -> ~/code/a/.worktrees). Outside the repo, so tools in the
+# repo do not scan the worktrees; next to it, so direnv loads the same parent
+# .envrc. A leading ~ is expanded.
 worktree_root() {
-  local root="${WTX_ROOT:-${WORKTREE_ROOT:-$HOME/code/.worktrees}}"
+  local root="${WTX_ROOT:-${WORKTREE_ROOT:-$(dirname "$1")/.worktrees}}"
   printf '%s\n' "${root/#\~/$HOME}"
 }
 
@@ -571,7 +574,7 @@ do_new() {
 
   local REPO ROOT DEST_DIR explicit NAME
   REPO="$(basename "$MAIN")"
-  ROOT="$(worktree_root)"
+  ROOT="$(worktree_root "$MAIN")"
   DEST_DIR="$ROOT/$REPO"
   if [ -n "$BRANCH" ]; then explicit=1; NAME="$BRANCH"; else explicit=0; NAME="$(gen_name)"; fi
   check_root_outside new "$ROOT" "$DEST_DIR" "$MAIN"
@@ -688,7 +691,7 @@ do_move() {
       echo "wtx move: '$WT_PATH' is detached -- give a DEST path." >&2
       exit 1
     fi
-    ROOT="$(worktree_root)"
+    ROOT="$(worktree_root "$MAIN")"
     SRC_LABEL="$(worktree_root_source)"
     DEST="$ROOT/$(basename "$MAIN")/$BRANCH"
     check_root_outside move "$ROOT" "$DEST" "$MAIN"
@@ -1121,7 +1124,7 @@ MODEL
   worktrees like any other config. No file = nothing to seed/push/pull, silently.
 
 new [BRANCH]
-  Create a worktree at $WTX_ROOT/<repo>/<branch> (default ~/code/.worktrees;
+  Create a worktree at $WTX_ROOT/<repo>/<branch> (default: .worktrees in the repo's parent folder;
   $WORKTREE_ROOT is read as a fallback for older setups) with a new branch forked
   from current HEAD (refuses a detached HEAD), then seed gitignored config from
   the primary checkout (overwriting -- the plot is fresh) and install deps if a
